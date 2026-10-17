@@ -1,0 +1,71 @@
+name: Build firmware
+
+on:
+  push:
+    branches: [main]
+    paths: ["metar_panel/**", ".github/workflows/build.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Cache Arduino cores and libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-m5stack-core2-v1
+
+      - name: Install M5Stack core and libraries
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+          arduino-cli core update-index
+          arduino-cli core install m5stack:esp32
+          arduino-cli lib update-index
+          arduino-cli lib install M5Unified ArduinoJson
+          arduino-cli core list
+          arduino-cli lib list
+
+      - name: Compile
+        run: arduino-cli compile --fqbn m5stack:esp32:m5stack_core2 --output-dir out --warnings default metar_panel
+
+      - name: Package update and full images
+        run: |
+          pip install --quiet esptool
+          V=$(grep -oP 'VERSION = "\K[^"]+' metar_panel/metar_panel.ino)
+          BOOT_APP0=$(find ~/.arduino15/packages/m5stack/hardware/esp32 -name boot_app0.bin | head -1)
+          ls -l out
+          cp out/metar_panel.ino.bin build/metar_panel_update_v$V.bin
+          python -m esptool --chip esp32 merge_bin -o build/metar_panel_core2_full_v$V.bin \
+            --flash_mode keep --flash_freq keep --flash_size keep \
+            0x1000 out/metar_panel.ino.bootloader.bin \
+            0x8000 out/metar_panel.ino.partitions.bin \
+            0xe000 "$BOOT_APP0" \
+            0x10000 out/metar_panel.ino.bin
+          ls -l build
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Commit images
+        run: |
+          git add build
+          if git diff --cached --quiet; then echo "No change."; exit 0; fi
+          git config user.name "metar-panel-build"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Build v$VERSION firmware images"
+          git pull --rebase --quiet
+          git push
